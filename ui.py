@@ -1,28 +1,33 @@
-import os
-import shutil
-import sys
-import subprocess
-import pandas as pd
 import gradio as gr
+import os
+import requests
+import tarfile
+import subprocess
+import shutil
 import zipfile
 
-
-# スクリプト自身のパスを取得
-script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-# カレントディレクトリをスクリプトのディレクトリに変更
-os.chdir(script_dir)
-
-# 設定
+# ディレクトリパス
+download_xz_folder = 'download_xz'
+download_exe_folder = 'download_exe'
 output_folder = 'output'
-blender_executable = './blender'  # Blender実行ファイルのパスを設定
+blender_executable = './blender'
 render_script = 'render.py'
-i = 0
-sleep_time = 1  # 秒
 
+# ディレクトリ内のフォルダリストを取得する関数
+def get_folder():
+    return [d for d in os.listdir(download_exe_folder) if os.path.isdir(os.path.join(download_exe_folder, d))]
 
+def update_folders():
+    return gr.Dropdown(choices=get_folder(), interactive=True)
+
+# 選択されたフォルダを使用してBlenderの実行ファイルパスを更新する関数
+def update_blender_executable(selected_folder):
+    global blender_executable
+    blender_executable = os.path.join(download_exe_folder, selected_folder, "blender")
+    print(f"Blender executable set to: {blender_executable}")
+    return f"Blender executable set to: {blender_executable}"
 
 def process_blend_files(file_path, start, end):
-    # コマンドの構築
     command = [
         blender_executable,
         "-b",
@@ -30,22 +35,18 @@ def process_blend_files(file_path, start, end):
         "-P",
         render_script,
         "--",
-        file_path,  # input フォルダ内のファイルのフルパス
+        file_path,
         str(start),
         str(end),
-        str(i)
+        str(0)
     ]
-    
-    # コマンドの実行
     subprocess.run(command)
 
 def process_file(file, start, end):
-    # Blenderファイルの処理を呼び出し
     process_blend_files(file.name, start, end)
 
-def clear_output_folder(output_folder):
-    # 出力フォルダを空にする
-    for root, dirs, files in os.walk(output_folder):
+def clear_output_folder(folder):
+    for root, dirs, files in os.walk(folder):
         for file in files:
             os.remove(os.path.join(root, file))
         for dir in dirs:
@@ -60,34 +61,98 @@ def zip_output_folder(output_folder):
                 zipf.write(file_path, os.path.relpath(file_path, output_folder))
     return zip_filename
 
-# Gradioのインターフェースを作成
-with gr.Blocks() as demo:
-    gr.Markdown("## ファイルアップロード UI")
+def download_and_extract(url):
+    status_message = "Starting download..."
+    try:
+        filename = url.split("/")[-1]
+        download_path = os.path.join(download_xz_folder, filename)
+        extract_folder = os.path.join(download_exe_folder, filename.split('.tar.xz')[0])
 
-    # UIコンポーネント
-    file_input = gr.File(label="ファイルをアップロード")
-    start_input = gr.Number(label="開始フレーム", value=0)
-    end_input = gr.Number(label="終了フレーム", value=1)
-    submit_button = gr.Button("Submit")
-    zip_output = gr.File(label="出力ファイルのダウンロード")
+        # Create directories if they do not exist
+        os.makedirs(download_xz_folder, exist_ok=True)
+        os.makedirs(download_exe_folder, exist_ok=True)
 
-    # 処理関数
-    def handle_file(file, start, end):
-        # 出力フォルダを空にする
-        clear_output_folder(output_folder)
-        
-        # Blenderファイルの処理
-        process_file(file, start, end)
-        
-        # ZIPファイルを作成
-        zip_path = zip_output_folder(output_folder)
-        return zip_path
+        # Download the file
+        response = requests.get(url, stream=True)
+        with open(download_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
 
-    # ボタンのアクションを定義
-    submit_button.click(fn=handle_file, inputs=[file_input, start_input, end_input], outputs=zip_output)
+        status_message = f"Downloaded {filename}. Extracting..."
 
-# アプリケーションを起動
+        # Extract the file
+        with tarfile.open(download_path, 'r:xz') as tar:
+            # Get the top-level directory name in the tar archive
+            top_level_dir = tar.getnames()[0].split('/')[0]
+            for member in tar.getmembers():
+                # Remove the top-level directory from the member name
+                member.name = os.path.relpath(member.name, top_level_dir)
+                tar.extract(member, extract_folder)
+
+        status_message = f"Extraction complete. {extract_folder}"
+
+    except Exception as e:
+        status_message = f"Error: {e}"
+
+    return status_message
+
+# Create Gradio interface
+def create_interface():
+    css = """
+    <style>
+        #update-button {
+            margin: 2.5em 0em 0em 0;
+            max-width: 2.5em;
+            min-width: 2.5em !important;
+            height: 2.4em;
+        }
+    </style>
+    """
+
+    with gr.Blocks() as demo:
+        gr.HTML(css)  # Add custom CSS
+
+        gr.Markdown("## Blender Rendering Web UI for Vast.ai")
+
+        # Tabbed interface
+        with gr.Tabs():
+            with gr.TabItem("Rendering"):
+                with gr.Row():
+                    dropdown = gr.Dropdown(label="Select Version", choices=get_folder(), interactive=True)
+                    update_button = gr.Button("🔄", elem_id="update-button")
+
+                file_input = gr.File(label="Upload File")
+                start_input = gr.Number(label="Start Frame", value=0)
+                end_input = gr.Number(label="End Frame", value=1)
+                submit_button = gr.Button("Start Rendering")
+                zip_output = gr.File(label="Download Output File")
+
+                def handle_file(file, start, end):
+                    clear_output_folder(output_folder)
+                    process_file(file, start, end)
+                    zip_path = zip_output_folder(output_folder)
+                    return zip_path
+
+                submit_button.click(fn=handle_file, inputs=[file_input, start_input, end_input], outputs=zip_output)
+                update_button.click(fn=update_folders, outputs=dropdown)
+                dropdown.change(fn=update_blender_executable, inputs=dropdown, outputs=None)
+
+            with gr.TabItem("Other Version"):
+                url_input = gr.Textbox(label="Enter URL (*-linux-x64.tar.xz)")
+                download_button = gr.Button("Download")
+                status_message = gr.Textbox(label="Status", value="", lines=3)
+
+                download_button.click(fn=download_and_extract, inputs=url_input, outputs=status_message)
+
+    return demo
+
+# Launch the application
 if __name__ == "__main__":
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
+    if not os.path.exists(download_xz_folder):
+        os.makedirs(download_xz_folder)
+    if not os.path.exists(download_exe_folder):
+        os.makedirs(download_exe_folder)
+    demo = create_interface()
     demo.launch(show_api=False, server_name="0.0.0.0")
